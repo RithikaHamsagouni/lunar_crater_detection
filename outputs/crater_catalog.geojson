@@ -1,0 +1,145 @@
+{
+  "type": "FeatureCollection",
+  "metadata": {
+    "total_craters": 5,
+    "source": "LROC NAC CDR \u2014 SER Portal",
+    "model": "Conditional DDPM + MC-Dropout"
+  },
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          0.0,
+          0.0
+        ]
+      },
+      "properties": {
+        "crater_type": "heavily_degraded",
+        "p_crater": 0.5291,
+        "degradation_score": 0.6003,
+        "age_estimate": "intermediate",
+        "overlap_iou": 0.0,
+        "diameter_m": 127.0,
+        "rim_sharpness": 0.7444,
+        "rim_completeness": 0.6838,
+        "depth_proxy": 0.0,
+        "circularity": 0.0163,
+        "resolution_m_px": 1.0,
+        "source_image": "010_png.rf.fcf5e274562ee69a325f9d7a0b30767f.jpg",
+        "centroid_y_px": 62.2,
+        "centroid_x_px": 61.6,
+        "uncertainty_std": 0.0144
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          0.0,
+          0.0
+        ]
+      },
+      "properties": {
+        "crater_type": "degraded",
+        "p_crater": 0.5295,
+        "degradation_score": 0.5829,
+        "age_estimate": "intermediate",
+        "overlap_iou": 0.0,
+        "diameter_m": 127.0,
+        "rim_sharpness": 0.7867,
+        "rim_completeness": 0.6854,
+        "depth_proxy": 0.0,
+        "circularity": 0.0309,
+        "resolution_m_px": 1.0,
+        "source_image": "015_png.rf.7d5b2091b6339c9480a171a59c52c3b9.jpg",
+        "centroid_y_px": 66.0,
+        "centroid_x_px": 64.7,
+        "uncertainty_std": 0.0167
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          0.0,
+          0.0
+        ]
+      },
+      "properties": {
+        "crater_type": "heavily_degraded",
+        "p_crater": 0.5275,
+        "degradation_score": 0.6172,
+        "age_estimate": "intermediate",
+        "overlap_iou": 0.0,
+        "diameter_m": 27.0,
+        "rim_sharpness": 0.6929,
+        "rim_completeness": 0.5902,
+        "depth_proxy": 0.0,
+        "circularity": 0.1486,
+        "resolution_m_px": 1.0,
+        "source_image": "015_png.rf.7d5b2091b6339c9480a171a59c52c3b9.jpg",
+        "centroid_y_px": 26.1,
+        "centroid_x_px": 90.3,
+        "uncertainty_std": 0.0215
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          0.0,
+          0.0
+        ]
+      },
+      "properties": {
+        "crater_type": "degraded",
+        "p_crater": 0.5298,
+        "degradation_score": 0.5609,
+        "age_estimate": "intermediate",
+        "overlap_iou": 0.0,
+        "diameter_m": 127.0,
+        "rim_sharpness": 0.8172,
+        "rim_completeness": 0.7505,
+        "depth_proxy": 0.0,
+        "circularity": 0.0197,
+        "resolution_m_px": 1.0,
+        "source_image": "019_png.rf.1930cd277f9bf0e3fa57f2dcfee0385f.jpg",
+        "centroid_y_px": 64.5,
+        "centroid_x_px": 63.6,
+        "uncertainty_std": 0.0289
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          0.0,
+          0.0
+        ]
+      },
+      "properties": {
+        "crater_type": "heavily_degraded",
+        "p_crater": 0.5273,
+        "degradation_score": 0.6437,
+        "age_estimate": "intermediate",
+        "overlap_iou": 0.0,
+        "diameter_m": 127.0,
+        "rim_sharpness": 0.5011,
+        "rim_completeness": 0.7481,
+        "depth_proxy": 0.0,
+        "circularity": 0.2087,
+        "resolution_m_px": 1.0,
+        "source_image": "mars_crater--100-_jpg.rf.a2ad5867efb2d73e86d9d980ca40a9fe.jpg",
+        "centroid_y_px": 68.4,
+        "centroid_x_px": 59.7,
+        "uncertainty_std": 0.0139
+      }
+    }
+  ]
+}

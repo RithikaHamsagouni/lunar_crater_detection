@@ -2,8 +2,6 @@ venv/
 __pycache__/
 *.pyc
 checkpoints/
-outputs/
-runs/
 *.pt
 *.zip
 .ipynb_checkpoints/
