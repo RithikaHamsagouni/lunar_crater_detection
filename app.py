@@ -2,9 +2,10 @@ import streamlit as st
 import numpy as np
 import cv2
 from PIL import Image
+import os
 
 from config import Config
-from inference import load_model, run_inference_on_image
+from inference import load_model, run_inference_on_image, save_output_image, norm_uint8
 from probability_head import ProbabilityHead
 from crater_classifier import CraterPipeline
 
@@ -68,8 +69,11 @@ if uploaded_file is not None:
 
     if results:
         vis_img = draw_craters(img_np, results)
-        st.image(vis_img, caption=f"Detected {len(results)} Crater(s)", use_column_width=True)
+        st.image(vis_img, caption=f"Detected {len(results)} Crater(s)", channels="BGR", use_column_width=True)
         st.success(f"✅ Detected {len(results)} craters")
+
+        # Save output image and JSON catalog
+        save_output_image(image_np, results, uploaded_file.name, output_dir=cfg.OUTPUT_DIR)
 
         st.subheader("Crater Details")
         for i, (cls_result, inst) in enumerate(results):
@@ -81,3 +85,9 @@ if uploaded_file is not None:
     else:
         st.warning("⚠️ No craters detected in this image.")
         st.image(image_pil, caption="Input image (no detections)", use_column_width=True)
+        
+        # Save plain image when no detections
+        os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
+        basename = os.path.splitext(uploaded_file.name)[0]
+        out_path = os.path.join(cfg.OUTPUT_DIR, f"{basename}_no_detections.jpg")
+        Image.fromarray(norm_uint8(image_np)).save(out_path)
