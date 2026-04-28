@@ -1,7 +1,7 @@
 import os, json, argparse
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 from scipy import ndimage
 
 from config import Config
@@ -54,58 +54,77 @@ def run_inference_on_image(image_np, model, schedule, prob_head, pipeline, cfg):
 
 
 # ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+def norm_uint8(arr):
+    a = arr - arr.min()
+    if a.max() > 0:
+        a = (a / a.max() * 255)
+    return a.astype(np.uint8)
+
+
+# ─────────────────────────────────────────────
 # Visualize & save output image
 # ─────────────────────────────────────────────
 def save_output_image(image_np, results, image_path, output_dir="outputs"):
     os.makedirs(output_dir, exist_ok=True)
 
-    # Normalize to 0–255 and convert to RGB for colored annotations
-    norm = image_np - image_np.min()
-    if norm.max() > 0:
-        norm = (norm / norm.max() * 255).astype(np.uint8)
-    else:
-        norm = norm.astype(np.uint8)
-
-    pil_img = Image.fromarray(norm).convert("RGB")
+    pil_img = Image.fromarray(norm_uint8(image_np)).convert("RGB")
     draw = ImageDraw.Draw(pil_img)
 
-    for i, (classification, instance) in enumerate(results):
-        cx = instance["centroid_x"]
-        cy = instance["centroid_y"]
-        radius = instance.get("radius_px", 10)   # use radius if available, else default
-        p = instance.get("p_crater", 0.0)
+    color_map = {
+        "fresh":            (0, 255, 0),
+        "degraded":         (0, 255, 255),
+        "heavily_degraded": (0, 165, 255),
+        "overlapping":      (0, 0, 255),
+        "uncertain":        (255, 80, 80),
+    }
 
-        # Draw circle around crater
+    for i, (classification, instance) in enumerate(results):
+        cx     = float(instance["centroid_x"])
+        cy     = float(instance["centroid_y"])
+        radius = float(instance["radius_px"])        # key defined in probability_head.py
+        p      = float(instance["p_crater"])
+        crater_type = classification.get("crater_type", "uncertain")
+        color  = color_map.get(crater_type, (255, 255, 255))
+
+        # Bounding ellipse
         x0, y0 = cx - radius, cy - radius
         x1, y1 = cx + radius, cy + radius
-        draw.ellipse([x0, y0, x1, y1], outline=(0, 255, 0), width=2)
+        draw.ellipse([x0, y0, x1, y1], outline=color, width=2)
+        # Centre dot
+        draw.ellipse([cx - 2, cy - 2, cx + 2, cy + 2], fill=color)
+        # Label
+        draw.text((x0, max(0, y0 - 14)),
+                  f"#{i+1} {crater_type} p={p:.2f}", fill=color)
 
-        # Label with index and confidence
-        label = f"#{i+1} {p:.2f}"
-        draw.text((x0, y0 - 14), label, fill=(0, 255, 0))
-
-    # Build output path
     basename = os.path.splitext(os.path.basename(image_path))[0]
     out_path = os.path.join(output_dir, f"{basename}_detected.jpg")
     pil_img.save(out_path)
-    print(f"[✓] Output image saved → {out_path}")
+    print(f"[✓] Output image  → {os.path.abspath(out_path)}")
 
-    # Also save JSON catalog
+    # JSON catalog
     catalog = []
     for classification, instance in results:
-        entry = {
-            "centroid_x": instance["centroid_x"],
-            "centroid_y": instance["centroid_y"],
-            "radius_px":  instance.get("radius_px"),
-            "p_crater":   instance.get("p_crater"),
-            "classification": str(classification),
-        }
-        catalog.append(entry)
+        catalog.append({
+            "centroid_x":        instance["centroid_x"],
+            "centroid_y":        instance["centroid_y"],
+            "radius_px":         instance["radius_px"],
+            "area_px":           instance["area_px"],
+            "p_crater":          instance["p_crater"],
+            "p_max":             instance["p_max"],
+            "crater_type":       classification.get("crater_type"),
+            "degradation_score": classification.get("degradation_score"),
+            "age_estimate":      classification.get("age_estimate"),
+            "overlap_iou":       classification.get("overlap_iou"),
+        })
 
     json_path = os.path.join(output_dir, f"{basename}_catalog.json")
     with open(json_path, "w") as f:
         json.dump(catalog, f, indent=2)
-    print(f"[✓] Catalog saved       → {json_path}")
+    print(f"[✓] JSON catalog  → {os.path.abspath(json_path)}")
+
+    return out_path
 
 
 # ─────────────────────────────────────────────
@@ -115,16 +134,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image",      required=True, help="Path to input image")
     parser.add_argument("--checkpoint", default="checkpoints/best_model.pt")
-    parser.add_argument("--output-dir", default="outputs", help="Directory for results")
+    parser.add_argument("--output-dir", default="outputs")
     args = parser.parse_args()
 
+    output_dir = args.output_dir   # argparse converts --output-dir → output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
     cfg = Config()
+    print(f"Device: {cfg.DEVICE}")
 
     model, schedule = load_model(args.checkpoint, cfg)
     prob_head = ProbabilityHead(model, cfg).to(cfg.DEVICE)
     pipeline  = CraterPipeline(cfg, cnn_model=None)
 
     image_np = np.array(Image.open(args.image).convert("L")).astype(np.float32)
+    print(f"Image loaded: {image_np.shape}  min={image_np.min():.1f}  max={image_np.max():.1f}")
 
     results, _ = run_inference_on_image(
         image_np, model, schedule, prob_head, pipeline, cfg
@@ -133,15 +157,13 @@ def main():
     print(f"Detected {len(results)} craters!")
 
     if results:
-        save_output_image(image_np, results, args.image, output_dir=args.output_dir)
+        save_output_image(image_np, results, args.image, output_dir=output_dir)
     else:
-        print("[!] No craters detected — no output image generated.")
-        # Save a plain copy anyway so you can confirm the image was read correctly
+        print("[!] No craters detected — saving plain image for verification.")
         basename = os.path.splitext(os.path.basename(args.image))[0]
-        os.makedirs(args.output_dir, exist_ok=True)
-        out_path = os.path.join(args.output_dir, f"{basename}_no_detections.jpg")
-        Image.fromarray(image_np.astype(np.uint8)).save(out_path)
-        print(f"[✓] Plain image saved  → {out_path}")
+        out_path = os.path.join(output_dir, f"{basename}_no_detections.jpg")
+        Image.fromarray(norm_uint8(image_np)).save(out_path)
+        print(f"[✓] Plain image → {os.path.abspath(out_path)}")
 
 
 if __name__ == "__main__":
