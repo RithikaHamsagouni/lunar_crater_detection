@@ -1,54 +1,127 @@
 """
-config.py — Central configuration for lunar south pole crater detection
-using diffusion models with probabilistic outputs.
+config.py — Central configuration for lunar crater diffusion system
+Optimized for:
+- VS Code (Windows laptop)
+- Colab
+- Kaggle
+- CPU + GPU
 """
 
+import os
 import torch
 
+
 class Config:
-    # ── Data ──────────────────────────────────────────────────────────────
-    DATA_CSV      = "ser_portal_luna_lroc_pds_nac_edrcdr_260406.csv"
-    IMAGE_DIR     = "images/"
-    PATCH_SIZE    = 128                # 128 for CPU, 256 for GPU
-    STRIDE        = 64
+    # ─────────────────────────────────────────────
+    # Base paths (absolute, cross-platform safe)
+    # ─────────────────────────────────────────────
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+    DATA_CSV  = os.path.join(BASE_DIR, "ser_portal_luna_lroc_pds_nac_edrcdr_260406.csv")
+    IMAGE_DIR = os.path.join(BASE_DIR, "images")
+
+    CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
+    OUTPUT_DIR     = os.path.join(BASE_DIR, "outputs")
+    LOG_DIR        = os.path.join(BASE_DIR, "runs")
+
+    # Auto-create required directories
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    # ─────────────────────────────────────────────
+    # Data
+    # ─────────────────────────────────────────────
+    PATCH_SIZE = 128          # CPU safe
+    STRIDE     = 64
+    VAL_SPLIT  = 0.15
+
     RESOLUTION_THRESH = 1.5
     QUALITY_THRESH    = 0
 
-    # ── Model ─────────────────────────────────────────────────────────────
-    IN_CHANNELS   = 1                 # grayscale NAC images
-    OUT_CHANNELS  = 1                 # binary crater mask
-    MODEL_DIM     = 32                # base channel width (64 for GPU, 32 for CPU)
-    TIMESTEPS     = 500               # noise schedule steps (1000 for GPU, 500 for CPU)
-    BETA_START    = 1e-4
-    BETA_END      = 0.02
-    DDIM_STEPS    = 20                # inference steps (50 for GPU, 20 for CPU)
+    # Training normalization stats
+    # Since lunar grayscale is normalized dynamically,
+    # these are fallback values for inference consistency.
+    TRAIN_MEAN = 0.5
+    TRAIN_STD  = 0.5
 
-    # ── Probability head ──────────────────────────────────────────────────
-    MC_SAMPLES    = 20                # Monte Carlo dropout passes
-    DROPOUT_RATE  = 0.15
+    # ─────────────────────────────────────────────
+    # Model
+    # ─────────────────────────────────────────────
+    IN_CHANNELS  = 1
+    OUT_CHANNELS = 1
 
-    # ── Crater classifier ─────────────────────────────────────────────────
-    # Degradation thresholds (0–1 score from morphology features)
-    FRESH_THRESH     = 0.75           # P(crater) >= 0.75 → fresh
-    DEGRADED_THRESH  = 0.40           # 0.40 <= P < 0.75 → degraded
-    # Below DEGRADED_THRESH → heavily eroded / uncertain
-    OVERLAP_IOU      = 0.15           # IoU threshold to flag overlap
+    MODEL_DIM    = 32       # CPU-safe
+    TIMESTEPS    = 500
+    DDIM_STEPS   = 20
 
-    # ── Training ──────────────────────────────────────────────────────────
-    BATCH_SIZE    = 4                  # 4 for CPU, 8-16 for GPU
+    # Beta schedule fallback (used if cosine disabled)
+    BETA_START   = 1e-4
+    BETA_END     = 0.02
+
+    USE_COSINE_SCHEDULE = True
+
+    # ─────────────────────────────────────────────
+    # Probability head
+    # ─────────────────────────────────────────────
+    MC_SAMPLES   = 10       # lower for CPU
+    DROPOUT_RATE = 0.15
+
+    # ─────────────────────────────────────────────
+    # Crater classification
+    # ─────────────────────────────────────────────
+    FRESH_THRESH    = 0.75
+    DEGRADED_THRESH = 0.40
+    OVERLAP_IOU     = 0.15
+
+    # ─────────────────────────────────────────────
+    # Training
+    # ─────────────────────────────────────────────
+    BATCH_SIZE    = 4
     EPOCHS        = 50
     LR            = 1e-4
     WEIGHT_DECAY  = 1e-5
     WARMUP_STEPS  = 200
     GRAD_CLIP     = 1.0
-    VAL_SPLIT     = 0.15
     SEED          = 42
 
-    # ── Hardware ──────────────────────────────────────────────────────────
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    NUM_WORKERS = 0                   # 0 = main process only (safe on Windows)
+    # Dice loss weighting
+    DICE_WEIGHT   = 0.5
+    BCE_WEIGHT    = 0.3
+    MSE_WEIGHT    = 1.0
 
-    # ── Output ────────────────────────────────────────────────────────────
-    CHECKPOINT_DIR = "checkpoints/"
-    OUTPUT_DIR     = "outputs/"
-    LOG_DIR        = "runs/"
+    # ─────────────────────────────────────────────
+    # Hardware
+    # ─────────────────────────────────────────────
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # IMPORTANT:
+    # Keep 0 for Windows/basic laptop + Zip safety
+    NUM_WORKERS = 0
+
+    PIN_MEMORY = torch.cuda.is_available()
+
+    # ─────────────────────────────────────────────
+    # Inference
+    # ─────────────────────────────────────────────
+    MIN_CRATER_PIXELS = 20
+    SLIDING_WINDOW_STRIDE = 64
+
+    # Save every N epochs
+    SAVE_VIS_EVERY = 5
+
+    # ─────────────────────────────────────────────
+    # Utility
+    # ─────────────────────────────────────────────
+    @staticmethod
+    def print_config():
+        print("── Config ─────────────────────────")
+        print(f"Device           : {Config.DEVICE}")
+        print(f"Patch Size       : {Config.PATCH_SIZE}")
+        print(f"Batch Size       : {Config.BATCH_SIZE}")
+        print(f"Timesteps        : {Config.TIMESTEPS}")
+        print(f"DDIM Steps       : {Config.DDIM_STEPS}")
+        print(f"Cosine Schedule  : {Config.USE_COSINE_SCHEDULE}")
+        print(f"Checkpoint Dir   : {Config.CHECKPOINT_DIR}")
+        print(f"Output Dir       : {Config.OUTPUT_DIR}")
+        print("──────────────────────────────────")
