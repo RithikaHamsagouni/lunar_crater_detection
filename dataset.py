@@ -1,247 +1,316 @@
-"""
-dataset.py — Safe crater dataset loader
-Fixes:
-- ZipFile multiprocessing bug
-- Real augmentation
-- Patch extraction
-- Normalization consistency
-"""
+# probability_head.py
 
-import os
-import io
-import zipfile
-import random
-import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
-from PIL import Image, ImageEnhance
-import torchvision.transforms as T
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+from dataclasses import dataclass
+from scipy import ndimage
 
 from config import Config
 
 
 # ─────────────────────────────────────────────
-# Patch extraction
+# Output container
 # ─────────────────────────────────────────────
-def extract_patches(image, mask, patch_size, stride):
-    img_patches, mask_patches = [], []
-
-    H, W = image.shape
-
-    if H < patch_size or W < patch_size:
-        image = np.array(
-            Image.fromarray(image).resize((patch_size, patch_size))
-        )
-        mask = np.array(
-            Image.fromarray(mask).resize((patch_size, patch_size))
-        )
-        return [image], [mask]
-
-    for y in range(0, H - patch_size + 1, stride):
-        for x in range(0, W - patch_size + 1, stride):
-            img_patches.append(image[y:y+patch_size, x:x+patch_size])
-            mask_patches.append(mask[y:y+patch_size, x:x+patch_size])
-
-    if len(img_patches) == 0:
-        img_patches.append(image[:patch_size, :patch_size])
-        mask_patches.append(mask[:patch_size, :patch_size])
-
-    return img_patches, mask_patches
+@dataclass
+class ProbabilisticOutput:
+    p_mean: torch.Tensor
+    p_std: torch.Tensor
+    p_entropy: torch.Tensor
+    p_aleatoric: torch.Tensor
+    binary_mask: torch.Tensor
+    confidence: torch.Tensor
 
 
 # ─────────────────────────────────────────────
-# YOLO boxes → crater mask
+# MC Dropout Wrapper
 # ─────────────────────────────────────────────
-def yolo_boxes_to_mask(boxes, H, W):
-    mask = np.zeros((H, W), dtype=np.uint8)
+class MCDropoutWrapper(nn.Module):
 
-    for cx, cy, bw, bh in boxes:
-        px = int(cx * W)
-        py = int(cy * H)
-        rx = max(1, int(bw * W / 2))
-        ry = max(1, int(bh * H / 2))
+    def __init__(self, model, dropout_rate=0.10):
+        super().__init__()
 
-        yy, xx = np.ogrid[:H, :W]
-        ellipse = ((xx - px) / rx) ** 2 + ((yy - py) / ry) ** 2 <= 1
-        mask[ellipse] = 1
+        self.model = model
 
-    return mask
+        self._patch_dropout(dropout_rate)
 
+    def _patch_dropout(self, rate):
 
-# ─────────────────────────────────────────────
-# Lightweight augmentations
-# ─────────────────────────────────────────────
-def augment_pair(image, mask):
-    if random.random() < 0.5:
-        image = image.transpose(Image.FLIP_LEFT_RIGHT)
-        mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
+        for module in self.model.modules():
 
-    if random.random() < 0.5:
-        image = image.transpose(Image.FLIP_TOP_BOTTOM)
-        mask = mask.transpose(Image.FLIP_TOP_BOTTOM)
+            if isinstance(module, nn.Dropout):
+                module.p = rate
 
-    if random.random() < 0.3:
-        angle = random.choice([90, 180, 270])
-        image = image.rotate(angle)
-        mask = mask.rotate(angle)
+    def _enable_dropout(self):
 
-    if random.random() < 0.3:
-        enhancer = ImageEnhance.Contrast(image)
-        image = enhancer.enhance(random.uniform(0.8, 1.2))
+        for module in self.model.modules():
 
-    return image, mask
+            if isinstance(module, nn.Dropout):
+                module.train()
+
+    def forward(self, *args, **kwargs):
+
+        self._enable_dropout()
+
+        return self.model(*args, **kwargs)
 
 
 # ─────────────────────────────────────────────
-class CraterDataset(Dataset):
-    def __init__(self, zip_path, split="train", patch_size=128, stride=64, augment=True):
-        assert split in ("train", "valid", "test")
+# Probability Head
+# ─────────────────────────────────────────────
+class ProbabilityHead(nn.Module):
 
-        self.zip_path = zip_path
-        self.split = split
-        self.patch_size = patch_size
-        self.stride = stride
-        self.augment = augment and split == "train"
+    def __init__(
+        self,
+        diffusion_model,
+        cfg: Config
+    ):
+        super().__init__()
 
-        self.img_prefix = f"craters/{split}/images/"
-        self.label_prefix = f"craters/{split}/labels/"
-
-        self.samples = []
-        self.zf = None
-
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            all_names = set(zf.namelist())
-
-            for name in sorted(all_names):
-                if name.startswith(self.img_prefix) and name.endswith(".jpg"):
-                    stem = os.path.basename(name).replace(".jpg", "")
-                    label_name = self.label_prefix + stem + ".txt"
-
-                    if label_name in all_names:
-                        self.samples.append((name, label_name))
-
-        if not self.samples:
-            raise ValueError(f"No samples found for split={split}")
-
-        self.to_tensor = T.ToTensor()
-
-        print(f"[{split}] {len(self.samples)} samples")
-
-    # Lazy ZipFile open (worker-safe)
-    def _get_zip(self):
-        if self.zf is None:
-            self.zf = zipfile.ZipFile(self.zip_path, "r")
-        return self.zf
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        zf = self._get_zip()
-
-        img_name, label_name = self.samples[idx]
-
-        img_bytes = zf.read(img_name)
-        label_text = zf.read(label_name).decode()
-
-        image = Image.open(io.BytesIO(img_bytes)).convert("L")
-        W, H = image.size
-
-        boxes = []
-
-        for line in label_text.strip().splitlines():
-            parts = line.split()
-            if len(parts) == 5:
-                _, cx, cy, bw, bh = map(float, parts)
-                boxes.append([cx, cy, bw, bh])
-
-        boxes = np.array(boxes) if boxes else np.zeros((0, 4))
-
-        image_np = np.array(image)
-        mask_np = yolo_boxes_to_mask(boxes, H, W)
-
-        img_patches, mask_patches = extract_patches(
-            image_np,
-            mask_np,
-            self.patch_size,
-            self.stride
+        self.mc_model = MCDropoutWrapper(
+            diffusion_model,
+            cfg.DROPOUT_RATE
         )
 
-        # Random patch
-        patch_idx = random.randint(0, len(img_patches) - 1)
+        self.n_samples = cfg.MC_SAMPLES
+        self.device = cfg.DEVICE
 
-        image_patch = Image.fromarray(img_patches[patch_idx])
-        mask_patch = Image.fromarray(mask_patches[patch_idx] * 255)
+        # Temperature scaling
+        self.temperature = nn.Parameter(
+            torch.ones(1)
+        )
 
-        if self.augment:
-            image_patch, mask_patch = augment_pair(image_patch, mask_patch)
+    @torch.no_grad()
+    def forward(
+        self,
+        raw_mask,
+        image,
+        t,
+        threshold=0.20
+    ):
 
-        img_t = self.to_tensor(image_patch).float()
+        samples = []
 
-        # Normalize exactly like training
-        mean = img_t.mean()
-        std = img_t.std()
+        for _ in range(self.n_samples):
 
-        img_t = (img_t - mean) / (std + 1e-6)
+            logits = self.mc_model(
+                raw_mask,
+                image,
+                t
+            )
 
-        mask_t = (self.to_tensor(mask_patch) > 0.5).float()
+            logits = logits / self.temperature.clamp(min=1e-3)
 
-        return {
-            "image": img_t,
-            "mask": mask_t,
-            "identifier": os.path.basename(img_name),
-            "n_craters": len(boxes),
-        }
+            probs = torch.sigmoid(logits)
+
+            samples.append(probs)
+
+        # [N, B, 1, H, W]
+        samples = torch.stack(
+            samples,
+            dim=0
+        )
+
+        # Mean probability
+        p_mean = samples.mean(dim=0)
+
+        # Epistemic uncertainty
+        p_std = samples.std(dim=0)
+
+        eps = 1e-6
+
+        # Predictive entropy
+        p_entropy = -(
+            p_mean * torch.log(p_mean + eps)
+            + (1 - p_mean) * torch.log(1 - p_mean + eps)
+        )
+
+        # Aleatoric uncertainty
+        sample_entropy = -(
+            samples * torch.log(samples + eps)
+            + (1 - samples) * torch.log(1 - samples + eps)
+        )
+
+        p_aleatoric = sample_entropy.mean(dim=0)
+
+        # Confidence
+        max_entropy = torch.log(
+            torch.tensor(
+                2.0,
+                device=p_mean.device
+            )
+        )
+
+        confidence = 1.0 - (
+            p_entropy / max_entropy
+        ).clamp(0, 1)
+
+        # Smooth probabilities
+        p_mean = torch.clamp(
+            p_mean,
+            0.0,
+            1.0
+        )
+
+        # Lower threshold for sparse crater detection
+        binary_mask = (
+            p_mean >= threshold
+        ).float()
+
+        return ProbabilisticOutput(
+            p_mean=p_mean,
+            p_std=p_std,
+            p_entropy=p_entropy,
+            p_aleatoric=p_aleatoric,
+            binary_mask=binary_mask,
+            confidence=confidence,
+        )
 
 
 # ─────────────────────────────────────────────
-def get_dataloaders(cfg: Config, zip_path):
-    train_ds = CraterDataset(
-        zip_path,
-        split="train",
-        patch_size=cfg.PATCH_SIZE,
-        stride=cfg.STRIDE,
-        augment=True,
+# Summary statistics
+# ─────────────────────────────────────────────
+def summarise_probabilities(out):
+
+    batch_size = out.p_mean.shape[0]
+
+    summaries = []
+
+    for i in range(batch_size):
+
+        pm = out.p_mean[i, 0]
+
+        detected = out.binary_mask[i, 0].bool()
+
+        summaries.append({
+
+            "max_p_crater":
+                pm.max().item(),
+
+            "mean_p_crater":
+                pm[detected].mean().item()
+                if detected.any()
+                else 0.0,
+
+            "pixel_coverage":
+                detected.float().mean().item(),
+
+            "mean_confidence":
+                out.confidence[i, 0].mean().item(),
+
+            "epistemic_uncertainty":
+                out.p_std[i, 0].mean().item(),
+
+            "aleatoric_uncertainty":
+                out.p_aleatoric[i, 0].mean().item(),
+        })
+
+    return summaries
+
+
+# ─────────────────────────────────────────────
+# Crater extraction
+# ─────────────────────────────────────────────
+def extract_crater_instances(
+    binary_mask,
+    p_mean,
+    min_pixels=8
+):
+    """
+    Connected component crater extraction
+    """
+
+    mask_np = (
+        binary_mask[0, 0]
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.uint8)
     )
 
-    val_ds = CraterDataset(
-        zip_path,
-        split="valid",
-        patch_size=cfg.PATCH_SIZE,
-        stride=cfg.STRIDE,
-        augment=False,
+    # Morphological cleanup
+    mask_np = ndimage.binary_opening(
+        mask_np,
+        structure=np.ones((3, 3))
     )
 
-    test_ds = CraterDataset(
-        zip_path,
-        split="test",
-        patch_size=cfg.PATCH_SIZE,
-        stride=cfg.STRIDE,
-        augment=False,
+    mask_np = ndimage.binary_closing(
+        mask_np,
+        structure=np.ones((3, 3))
     )
 
-    train_dl = DataLoader(
-        train_ds,
-        batch_size=cfg.BATCH_SIZE,
-        shuffle=True,
-        num_workers=cfg.NUM_WORKERS,
-        pin_memory=cfg.PIN_MEMORY,
+    labeled, n_components = ndimage.label(
+        mask_np
     )
 
-    val_dl = DataLoader(
-        val_ds,
-        batch_size=cfg.BATCH_SIZE,
-        shuffle=False,
-        num_workers=cfg.NUM_WORKERS,
-        pin_memory=cfg.PIN_MEMORY,
+    prob_map = (
+        p_mean[0, 0]
+        .detach()
+        .cpu()
+        .numpy()
     )
 
-    test_dl = DataLoader(
-        test_ds,
-        batch_size=cfg.BATCH_SIZE,
-        shuffle=False,
-        num_workers=cfg.NUM_WORKERS,
-        pin_memory=cfg.PIN_MEMORY,
+    craters = []
+
+    for label_id in range(1, n_components + 1):
+
+        region = labeled == label_id
+
+        area = region.sum()
+
+        if area < min_pixels:
+            continue
+
+        ys, xs = np.where(region)
+
+        if len(xs) == 0:
+            continue
+
+        centroid_x = xs.mean()
+        centroid_y = ys.mean()
+
+        width = xs.max() - xs.min()
+        height = ys.max() - ys.min()
+
+        radius = max(width, height) / 2.0
+
+        p_vals = prob_map[region]
+
+        mean_prob = p_vals.mean()
+        max_prob = p_vals.max()
+
+        # Reject weak detections
+        if mean_prob < 0.15:
+            continue
+
+        craters.append({
+
+            "centroid_x":
+                float(centroid_x),
+
+            "centroid_y":
+                float(centroid_y),
+
+            "radius_px":
+                float(max(3.0, radius)),
+
+            "p_crater":
+                float(mean_prob),
+
+            "p_max":
+                float(max_prob),
+
+            "area_px":
+                int(area),
+        })
+
+    # Sort by confidence
+    craters = sorted(
+        craters,
+        key=lambda x: x["p_crater"],
+        reverse=True
     )
 
-    return train_dl, val_dl, test_dl
+    return craters
