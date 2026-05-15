@@ -1,12 +1,13 @@
 # train.py
 """
-Training loop for lunar crater diffusion model
-Fixed for:
-- CPU / GPU compatibility
-- Kaggle / Colab support
-- Stable checkpoint saving
+Improved training loop for lunar crater diffusion model
+
+Changes:
+- Dice loss instead of BCE
+- Better timestep sampling
+- Stable validation
+- Soft Dice evaluation
 - Better logging
-- Fast smoke-test mode
 """
 
 import os
@@ -36,11 +37,11 @@ try:
     TB_AVAILABLE = True
 except ImportError:
     TB_AVAILABLE = False
-    print("[INFO] TensorBoard not installed. Logging to console only.")
+    print("[INFO] TensorBoard not installed.")
 
 
 # ─────────────────────────────────────────────
-# Seed everything
+# Seed
 # ─────────────────────────────────────────────
 def set_seed(seed):
     random.seed(seed)
@@ -52,47 +53,76 @@ def set_seed(seed):
 
 
 # ─────────────────────────────────────────────
-# Diffusion loss
+# Dice loss
+# ─────────────────────────────────────────────
+def dice_loss_fn(pred_probs, target):
+    intersection = (pred_probs * target).sum(dim=[1, 2, 3])
+
+    union = (
+        pred_probs.sum(dim=[1, 2, 3])
+        + target.sum(dim=[1, 2, 3])
+    )
+
+    dice = (
+        (2 * intersection + 1)
+        / (union + 1)
+    )
+
+    return 1 - dice.mean()
+
+
+# ─────────────────────────────────────────────
+# Diffusion Loss
 # ─────────────────────────────────────────────
 def diffusion_loss(model, schedule, image, mask, device):
     """
-    DDPM + BCE hybrid loss
+    DDPM + Dice hybrid loss
     """
+
     B = image.size(0)
 
+    # Sample timestep
     t = torch.randint(
-        low=1,
+        low=0,
         high=schedule.T,
         size=(B,),
         device=device
     )
 
+    # Gaussian noise
     noise = torch.randn_like(mask)
 
+    # Forward diffusion
     x_t, _ = schedule.q_sample(mask, t, noise)
 
+    # Predict noise
     pred_noise = model(x_t, image, t)
 
-    # Main DDPM loss
+    # DDPM noise prediction loss
     mse_loss = F.mse_loss(pred_noise, noise)
 
     # Reconstruct x0
     sqrt_ah = schedule.sqrt_alpha_hat[t][:, None, None, None]
     sqrt_om = schedule.sqrt_one_minus_alpha_hat[t][:, None, None, None]
 
-    x0_pred = (x_t - sqrt_om * pred_noise) / (sqrt_ah + 1e-6)
+    x0_pred = (
+        x_t - sqrt_om * pred_noise
+    ) / (sqrt_ah + 1e-6)
 
-    # Auxiliary BCE
-    bce_loss = F.binary_cross_entropy_with_logits(
-        x0_pred,
-        mask.clamp(0, 1)
+    probs = torch.sigmoid(x0_pred)
+
+    # Dice loss
+    dice_loss = dice_loss_fn(
+        probs,
+        mask
     )
 
-    total_loss = mse_loss + 0.5 * bce_loss
+    # Total
+    total_loss = mse_loss + dice_loss
 
     return total_loss, {
         "mse": mse_loss.item(),
-        "bce": bce_loss.item()
+        "dice": dice_loss.item()
     }
 
 
@@ -104,7 +134,7 @@ def evaluate(model, schedule, val_loader, device):
     model.eval()
 
     total_dice = 0.0
-    total_bce = 0.0
+    total_loss = 0.0
     batches = 0
 
     for batch in val_loader:
@@ -114,6 +144,7 @@ def evaluate(model, schedule, val_loader, device):
 
             B = image.size(0)
 
+            # Mid timestep validation
             t = torch.full(
                 (B,),
                 schedule.T // 2,
@@ -123,30 +154,52 @@ def evaluate(model, schedule, val_loader, device):
 
             noise = torch.randn_like(mask)
 
-            x_t, _ = schedule.q_sample(mask, t, noise)
+            x_t, _ = schedule.q_sample(
+                mask,
+                t,
+                noise
+            )
 
-            pred_noise = model(x_t, image, t)
+            pred_noise = model(
+                x_t,
+                image,
+                t
+            )
 
             sqrt_ah = schedule.sqrt_alpha_hat[t][:, None, None, None]
             sqrt_om = schedule.sqrt_one_minus_alpha_hat[t][:, None, None, None]
 
-            x0_pred = (x_t - sqrt_om * pred_noise) / (sqrt_ah + 1e-6)
+            x0_pred = (
+                x_t - sqrt_om * pred_noise
+            ) / (sqrt_ah + 1e-6)
 
-            pred_mask = (torch.sigmoid(x0_pred) > 0.5).float()
+            probs = torch.sigmoid(x0_pred)
 
-            intersection = (pred_mask * mask).sum(dim=[2, 3])
+            # Soft Dice
+            intersection = (
+                probs * mask
+            ).sum(dim=[2, 3])
 
             dice = (
                 (2 * intersection + 1)
-                / (pred_mask.sum(dim=[2, 3]) + mask.sum(dim=[2, 3]) + 1)
+                / (
+                    probs.sum(dim=[2, 3])
+                    + mask.sum(dim=[2, 3])
+                    + 1
+                )
             )
 
             total_dice += dice.mean().item()
 
-            total_bce += F.binary_cross_entropy_with_logits(
-                x0_pred,
-                mask
-            ).item()
+            loss = diffusion_loss(
+                model,
+                schedule,
+                image,
+                mask,
+                device
+            )[0]
+
+            total_loss += loss.item()
 
             batches += 1
 
@@ -159,17 +212,17 @@ def evaluate(model, schedule, val_loader, device):
     if batches == 0:
         return {
             "val_dice": 0.0,
-            "val_bce": 999.0
+            "val_loss": 999.0
         }
 
     return {
         "val_dice": total_dice / batches,
-        "val_bce": total_bce / batches
+        "val_loss": total_loss / batches
     }
 
 
 # ─────────────────────────────────────────────
-# Main training
+# Training
 # ─────────────────────────────────────────────
 def train(args):
     cfg = Config()
@@ -184,11 +237,14 @@ def train(args):
     if args.patch_size:
         cfg.PATCH_SIZE = args.patch_size
 
+    # Recommended
+    cfg.TIMESTEPS = 50
+
     if args.fast:
         cfg.EPOCHS = 2
         cfg.BATCH_SIZE = 4
         cfg.PATCH_SIZE = 128
-        cfg.TIMESTEPS = 100
+        cfg.TIMESTEPS = 20
         print("[FAST MODE ENABLED]")
 
     set_seed(cfg.SEED)
@@ -206,14 +262,13 @@ def train(args):
     print(f"Patch size   : {cfg.PATCH_SIZE}")
     print(f"Timesteps    : {cfg.TIMESTEPS}")
 
-    # Dataset zip
     zip_path = args.zip
 
     if not os.path.exists(zip_path):
-        print(f"ERROR: Dataset zip not found: {zip_path}")
+        print(f"Dataset zip not found: {zip_path}")
         sys.exit(1)
 
-    # Loaders
+    # Load data
     train_loader, val_loader, _ = get_dataloaders(
         cfg,
         zip_path=zip_path
@@ -222,7 +277,7 @@ def train(args):
     print(f"Train batches: {len(train_loader)}")
     print(f"Val batches  : {len(val_loader)}")
 
-    # Model
+    # Build model
     model, schedule = build_model(cfg)
 
     total_params = sum(
@@ -246,13 +301,11 @@ def train(args):
         eta_min=cfg.LR * 0.01
     )
 
-    # Mixed precision
     scaler = torch.amp.GradScaler(
         "cuda",
         enabled=use_cuda
     )
 
-    # TensorBoard
     writer = SummaryWriter(cfg.LOG_DIR) if TB_AVAILABLE else None
 
     best_dice = 0.0
@@ -264,13 +317,14 @@ def train(args):
     )
 
     with open(log_csv, "w") as f:
-        f.write("epoch,train_loss,val_dice,val_bce\n")
+        f.write("epoch,train_loss,val_dice,val_loss\n")
 
     print("\n---- TRAINING STARTED ----")
 
     max_batches = 2 if args.fast else None
 
     for epoch in range(1, cfg.EPOCHS + 1):
+
         model.train()
 
         epoch_loss = 0.0
@@ -282,12 +336,21 @@ def train(args):
         )
 
         for batch_idx, batch in enumerate(progress):
+
             if max_batches and batch_idx >= max_batches:
                 break
 
             try:
                 image = batch["image"].to(device)
                 mask = batch["mask"].to(device)
+
+                # Debug once
+                if epoch == 1 and batch_idx == 0:
+                    print(
+                        "Mask range:",
+                        mask.min().item(),
+                        mask.max().item()
+                    )
 
                 optimizer.zero_grad()
 
@@ -322,7 +385,7 @@ def train(args):
                 progress.set_postfix({
                     "loss": f"{loss.item():.4f}",
                     "mse": f"{logs['mse']:.4f}",
-                    "bce": f"{logs['bce']:.4f}",
+                    "dice": f"{logs['dice']:.4f}",
                 })
 
                 if writer:
@@ -340,7 +403,7 @@ def train(args):
         scheduler.step()
 
         if batches_done == 0:
-            print("No batches completed this epoch.")
+            print("No batches completed.")
             continue
 
         avg_train_loss = epoch_loss / batches_done
@@ -354,22 +417,22 @@ def train(args):
         )
 
         val_dice = val_metrics["val_dice"]
-        val_bce = val_metrics["val_bce"]
+        val_loss = val_metrics["val_loss"]
 
         print(
             f"Epoch {epoch}: "
             f"train_loss={avg_train_loss:.4f}, "
             f"val_dice={val_dice:.4f}, "
-            f"val_bce={val_bce:.4f}"
+            f"val_loss={val_loss:.4f}"
         )
 
-        # CSV log
+        # CSV logging
         with open(log_csv, "a") as f:
             f.write(
-                f"{epoch},{avg_train_loss:.6f},{val_dice:.6f},{val_bce:.6f}\n"
+                f"{epoch},{avg_train_loss:.6f},{val_dice:.6f},{val_loss:.6f}\n"
             )
 
-        # Save last
+        # Save last checkpoint
         last_path = os.path.join(
             cfg.CHECKPOINT_DIR,
             "last_model.pt"
@@ -386,6 +449,7 @@ def train(args):
 
         # Save best
         if val_dice > best_dice:
+
             best_dice = val_dice
 
             best_path = os.path.join(
@@ -403,7 +467,7 @@ def train(args):
             }, best_path)
 
             print(
-                f"[*] Best model saved: {best_path} "
+                f"[*] Best model saved "
                 f"(dice={best_dice:.4f})"
             )
 
@@ -419,6 +483,7 @@ def train(args):
 # CLI
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
