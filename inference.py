@@ -1,329 +1,159 @@
-# inference.py
-"""
-Inference for lunar crater detection
-Fixed for:
-- Proper checkpoint loading
-- Safe CPU/GPU support
-- Correct crater extraction
-- Green crater circle + red center dot
-- JSON + image saving
-"""
-
-import os
-import json
-import argparse
-import numpy as np
 import torch
-
-from PIL import Image, ImageDraw
-from scipy import ndimage
-
-from config import Config
-from diffusion_model import build_model
-from probability_head import ProbabilityHead, extract_crater_instances
-from crater_classifier import CraterPipeline
-
-
-# ─────────────────────────────────────────────
-# Load model
-# ─────────────────────────────────────────────
-def load_model(checkpoint_path, cfg):
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(
-            f"Checkpoint not found: {checkpoint_path}"
-        )
-
-    model, schedule = build_model(cfg)
-
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location=cfg.DEVICE
-    )
-
-    model.load_state_dict(checkpoint["model_state"])
-
-    model.eval()
-
-    print(
-        f"Loaded checkpoint: epoch={checkpoint.get('epoch', '?')}, "
-        f"val_dice={checkpoint.get('val_dice', 0):.4f}"
-    )
-
-    return model, schedule
-
-
-# ─────────────────────────────────────────────
-# Normalize image
-# ─────────────────────────────────────────────
-def norm_uint8(arr):
-    arr = arr.astype(np.float32)
-
-    arr = arr - arr.min()
-
-    if arr.max() > 0:
-        arr = (arr / arr.max()) * 255.0
-
-    return arr.astype(np.uint8)
-
-
-# ─────────────────────────────────────────────
-# Core inference
-# ─────────────────────────────────────────────
-@torch.no_grad()
-def run_inference_on_image(
-    image_np,
-    model,
-    schedule,
-    prob_head,
-    pipeline,
-    cfg
-):
-    image_tensor = torch.tensor(
-        image_np,
-        dtype=torch.float32
-    ).unsqueeze(0).unsqueeze(0).to(cfg.DEVICE)
-
-    # DDIM reverse diffusion
-    raw_mask = schedule.ddim_sample(
-        model,
-        image_tensor,
-        steps=cfg.DDIM_STEPS
-    )
-
-    t = torch.zeros(
-        1,
-        dtype=torch.long,
-        device=cfg.DEVICE
-    )
-
-    prob_out = prob_head(
-        raw_mask,
-        image_tensor,
-        t
-    )
-
-    if not prob_out.binary_mask.any():
-        return [], image_np
-
-    # Extract crater instances
-    instances = extract_crater_instances(
-        prob_out.binary_mask,
-        prob_out.p_mean,
-        min_pixels=20
-    )
-
-    labeled_mask, _ = ndimage.label(
-        prob_out.binary_mask[0, 0].cpu().numpy().astype(np.uint8)
-    )
-
-    instance_masks = []
-    p_craters = []
-
-    for inst in instances:
-        cx = int(inst["centroid_x"])
-        cy = int(inst["centroid_y"])
-
-        label_id = labeled_mask[cy, cx]
-
-        if label_id > 0:
-            instance_masks.append(labeled_mask == label_id)
-            p_craters.append(inst["p_crater"])
-
-    classifications = pipeline.classify(
-        image_np,
-        instance_masks,
-        p_craters,
-        resolution_m=1.0
-    )
-
-    return list(zip(classifications, instances)), image_np
-
-
-# ─────────────────────────────────────────────
-# Save visual output
-# ─────────────────────────────────────────────
-def save_output_image(
-    image_np,
-    results,
-    image_path,
-    output_dir="outputs"
-):
-    os.makedirs(output_dir, exist_ok=True)
-
-    image_rgb = Image.fromarray(
-        norm_uint8(image_np)
-    ).convert("RGB")
-
-    draw = ImageDraw.Draw(image_rgb)
-
-    color_map = {
-        "fresh": (0, 255, 0),
-        "degraded": (255, 255, 0),
-        "heavily_degraded": (255, 165, 0),
-        "overlapping": (255, 0, 0),
-        "uncertain": (180, 180, 180),
-    }
-
-    catalog = []
-
-    for i, (classification, instance) in enumerate(results):
-        cx = float(instance["centroid_x"])
-        cy = float(instance["centroid_y"])
-        r = max(5, float(instance["radius_px"]))
-
-        crater_type = classification.get(
-            "crater_type",
-            "uncertain"
-        )
-
-        color = color_map.get(
-            crater_type,
-            (255, 255, 255)
-        )
-
-        # Green circle
-        draw.ellipse(
-            [cx - r, cy - r, cx + r, cy + r],
-            outline=color,
-            width=2
-        )
-
-        # Red center dot
-        draw.ellipse(
-            [cx - 3, cy - 3, cx + 3, cy + 3],
-            fill=(255, 0, 0)
-        )
-
-        # Label
-        draw.text(
-            (cx - r, max(0, cy - r - 12)),
-            f"#{i+1}",
-            fill=color
-        )
-
-        catalog.append({
-            "crater_id": i + 1,
-            "centroid_x": instance["centroid_x"],
-            "centroid_y": instance["centroid_y"],
-            "radius_px": instance["radius_px"],
-            "p_crater": instance["p_crater"],
-            "crater_type": crater_type,
-            "age_estimate": classification.get("age_estimate"),
-            "degradation_score": classification.get("degradation_score"),
-        })
-
-    basename = os.path.splitext(
-        os.path.basename(image_path)
-    )[0]
-
-    out_img = os.path.join(
-        output_dir,
-        f"{basename}_detected.jpg"
-    )
-
-    out_json = os.path.join(
-        output_dir,
-        f"{basename}_catalog.json"
-    )
-
-    image_rgb.save(out_img)
-
-    with open(out_json, "w") as f:
-        json.dump(catalog, f, indent=2)
-
-    print(f"[*] Saved image: {out_img}")
-    print(f"[*] Saved JSON : {out_json}")
-
-    return out_img
-
-
-# ─────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────
-def main():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--image",
-        required=True,
-        help="Path to input image"
-    )
-
-    parser.add_argument(
-        "--checkpoint",
-        default="checkpoints/best_model.pt"
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        default="outputs"
-    )
-
-    args = parser.parse_args()
-
-    cfg = Config()
-
-    print(f"Using device: {cfg.DEVICE}")
-
-    model, schedule = load_model(
-        args.checkpoint,
-        cfg
-    )
-
-    prob_head = ProbabilityHead(
-        model,
-        cfg
-    ).to(cfg.DEVICE)
-
-    pipeline = CraterPipeline(
-        cfg,
-        cnn_model=None
-    )
-
-    image_np = np.array(
-        Image.open(args.image).convert("L")
-    ).astype(np.float32)
-
-    print(f"Image shape: {image_np.shape}")
-
-    results, _ = run_inference_on_image(
-        image_np,
-        model,
-        schedule,
-        prob_head,
-        pipeline,
-        cfg
-    )
-
-    print(f"Detected {len(results)} craters!")
-
-    if results:
-        save_output_image(
-            image_np,
-            results,
-            args.image,
-            args.output_dir
-        )
+import cv2
+import numpy as np
+import argparse
+import os
+import segmentation_models_pytorch as smp
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--image', type=str, required=True)
+parser.add_argument('--checkpoint', type=str, required=True)
+parser.add_argument('--threshold', type=float, default=0.3,
+                    help='Detection threshold (lower = more craters detected, default=0.3)')
+parser.add_argument('--min_area', type=int, default=50,
+                    help='Minimum contour area in pixels (filters noise, default=50)')
+parser.add_argument('--encoder', type=str, default='resnet34',
+                    help='Encoder backbone used during training (default: resnet34)')
+args = parser.parse_args()
+
+# ── Load & preprocess image ──────────────────────────────────────────────────
+orig_bgr = cv2.imread(args.image)
+if orig_bgr is None:
+    raise FileNotFoundError(f"Could not read image: {args.image}")
+
+gray = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2GRAY)
+
+# CLAHE gives better local contrast than plain equalizeHist
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+enhanced = clahe.apply(gray)
+
+# Mild Gaussian blur to reduce sensor noise before model input
+blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
+
+tensor = torch.tensor(blurred / 255.0).unsqueeze(0).unsqueeze(0).float()
+
+# ── Load model ───────────────────────────────────────────────────────────────
+# Build the architecture (must match what train.py used)
+model = smp.Unet(
+    encoder_name=args.encoder,
+    encoder_weights=None,   # no pretrained weights needed — we load from checkpoint
+    in_channels=1,          # grayscale input
+    classes=1,              # binary crater / no-crater output
+)
+
+# Load checkpoint — handles both full model saves and state_dict saves
+ckpt = torch.load(args.checkpoint, map_location='cpu')
+
+if isinstance(ckpt, dict):
+    # Training checkpoint with extra keys (epoch, optimizer, loss, etc.)
+    if 'model_state_dict' in ckpt:
+        state_dict = ckpt['model_state_dict']
+    elif 'state_dict' in ckpt:
+        state_dict = ckpt['state_dict']
     else:
-        print("[!] No craters detected.")
+        # Assume the dict itself IS the state_dict
+        state_dict = ckpt
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError as e:
+        # Strip 'module.' prefix added by DataParallel training
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
+else:
+    # Full model object saved with torch.save(model, ...)
+    model = ckpt
 
-        os.makedirs(args.output_dir, exist_ok=True)
+model.eval()
 
-        basename = os.path.splitext(
-            os.path.basename(args.image)
-        )[0]
+with torch.no_grad():
+    prob_map = model(tensor)[0][0].numpy()   # shape: (H, W), values 0–1
 
-        out_path = os.path.join(
-            args.output_dir,
-            f"{basename}_no_detections.jpg"
-        )
+# ── Post-process probability map ─────────────────────────────────────────────
+# 1. Smooth the probability map to merge nearby high-confidence regions
+prob_smooth = cv2.GaussianBlur(prob_map, (5, 5), 0)
 
-        Image.fromarray(
-            norm_uint8(image_np)
-        ).save(out_path)
+# 2. Threshold at user-defined level (default 0.3 instead of 0.7)
+binary = (prob_smooth > args.threshold).astype(np.uint8) * 255
 
-        print(f"[*] Saved plain image: {out_path}")
+# 3. Morphological closing to fill small holes inside crater rims
+kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+binary_closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
+# 4. Remove tiny speckles (noise)
+binary_clean = cv2.morphologyEx(binary_closed, cv2.MORPH_OPEN, kernel)
 
-if __name__ == "__main__":
-    main()
+# ── Find contours & draw detections ──────────────────────────────────────────
+contours, _ = cv2.findContours(binary_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+output_img = orig_bgr.copy()
+detected_count = 0
+
+for cnt in contours:
+    area = cv2.contourArea(cnt)
+    if area < args.min_area:
+        continue  # skip noise
+
+    # Fit a minimum enclosing circle for each detected region
+    (cx, cy), radius = cv2.minEnclosingCircle(cnt)
+    cx, cy, radius = int(cx), int(cy), int(radius)
+
+    # Circularity check: real craters are roughly circular
+    perimeter = cv2.arcLength(cnt, True)
+    if perimeter == 0:
+        continue
+    circularity = 4 * np.pi * area / (perimeter ** 2)
+
+    if circularity < 0.2:   # skip very non-circular blobs
+        continue
+
+    # Color-code by confidence: green=high, yellow=medium, red=low
+    cx_region = np.clip(cy, 0, prob_map.shape[0]-1)
+    cy_region = np.clip(cx, 0, prob_map.shape[1]-1)
+    confidence = float(prob_map[cx_region, cy_region])
+
+    if confidence > 0.6:
+        color = (0, 255, 0)      # green  – high confidence
+    elif confidence > 0.4:
+        color = (0, 255, 255)    # yellow – medium confidence
+    else:
+        color = (0, 100, 255)    # orange – low confidence
+
+    cv2.circle(output_img, (cx, cy), radius, color, 2)
+    cv2.circle(output_img, (cx, cy), 2, color, -1)   # center dot
+
+    detected_count += 1
+
+# ── Save outputs ──────────────────────────────────────────────────────────────
+os.makedirs("outputs", exist_ok=True)
+
+base = os.path.splitext(os.path.basename(args.image))[0]
+
+# Detected image with circles
+out_detected = f"outputs/{base}_detected.jpg"
+cv2.imwrite(out_detected, output_img)
+
+# Probability heatmap (viridis colormap for readability)
+prob_u8 = (prob_map * 255).astype(np.uint8)
+heatmap = cv2.applyColorMap(prob_u8, cv2.COLORMAP_VIRIDIS)
+out_heatmap = f"outputs/{base}_heatmap.jpg"
+cv2.imwrite(out_heatmap, heatmap)
+
+# Binary mask
+out_mask = f"outputs/{base}_mask.jpg"
+cv2.imwrite(out_mask, binary_clean)
+
+# Side-by-side comparison
+h, w = orig_bgr.shape[:2]
+heatmap_resized = cv2.resize(heatmap, (w, h))
+comparison = np.hstack([orig_bgr, heatmap_resized, output_img])
+out_compare = f"outputs/{base}_comparison.jpg"
+cv2.imwrite(out_compare, comparison)
+
+print(f"✅ Detected {detected_count} craters (threshold={args.threshold}, min_area={args.min_area})")
+print(f"   - Detection image : {out_detected}")
+print(f"   - Probability map : {out_heatmap}")
+print(f"   - Binary mask     : {out_mask}")
+print(f"   - Comparison      : {out_compare}")
+print()
+print("Tip: If still missing craters, lower --threshold (e.g. 0.2)")
+print("Tip: If too many false positives, raise --threshold (e.g. 0.4) or --min_area")
