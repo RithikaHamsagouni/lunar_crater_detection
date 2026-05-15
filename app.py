@@ -243,3 +243,4 @@ if uploaded_file is not None:
         Image.fromarray(
             norm_uint8(image_np)
         ).save(out_path)
+        
