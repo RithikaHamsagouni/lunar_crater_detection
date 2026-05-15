@@ -496,3 +496,4 @@ class CraterPipeline:
                 "overlapping"
             ]:
                 result["crater_type"] = best_class
+                
